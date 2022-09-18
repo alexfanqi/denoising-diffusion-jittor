@@ -44,8 +44,10 @@ diffusion = GaussianDiffusion(
 
 # training_images = jt.randn(8, 3, 128, 128) # images are normalized from 0 to 1
 # loss = diffusion(training_images)
-trainer = Trainer(diffusion, dataset, train_num_steps=11, save_and_sample_every=10, num_samples=4, ema_update_every=10, train_lr=0.001)
-trainer.load(1, '../denoising-diffusion-pytorch/results')
-#trainer.load(1)
-#trainer.train()
-trainer.autodiff()
+trainer = Trainer(diffusion, dataset, train_num_steps=11, save_and_sample_every=10, num_samples=4, ema_update_every=100, train_lr=0.001, results_folder='./results/mnist/')
+breakpoint()
+#trainer.save(0, model_ext='pkl')
+#trainer.load("000", '../denoising-diffusion-pytorch/results')
+trainer.load(0)
+trainer.train()
+#trainer.autodiff()

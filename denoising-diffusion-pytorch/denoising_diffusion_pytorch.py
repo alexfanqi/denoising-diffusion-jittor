@@ -1,5 +1,6 @@
 import math
 import copy
+import numpy as np
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
@@ -629,8 +630,7 @@ class GaussianDiffusion(nn.Module):
     def forward(self, img, *args, **kwargs):
         b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
         assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
-        t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
-
+        t = torch.randint(0, self.num_timesteps, (b,), device=device)
         img = normalize_to_neg_one_to_one(img)
         return self.p_losses(img, t, *args, **kwargs)
 
@@ -719,18 +719,22 @@ class Trainer(object):
         # step counter state
 
         self.step = 0
+        self.loss = []
 
-    def save(self, milestone, model_ext='pkl'):
+    def save(self, milestone, model_ext='pth'):
+        if self.device.type.startswith('cuda'):
+            torch.cuda.synchronize()
         data = {
             'step': self.step,
             'model': self.model.state_dict(),
             'opt': self.opt.state_dict(),
             'ema': self.ema.state_dict(),
+            'loss': self.loss
         }
 
         torch.save(data, str(self.results_folder / f'model-{milestone}.{model_ext}'))
 
-    def load(self, milestone, folder=None, model_ext='pkl'):
+    def load(self, milestone, folder=None, model_ext='pth'):
         if folder is None:
             folder = self.results_folder
         else:
@@ -743,6 +747,7 @@ class Trainer(object):
         self.step = data['step']
         self.opt.load_state_dict(data['opt'])
         self.ema.load_state_dict(data['ema'])
+        self.loss = data['loss']
 
     def train(self):
         device = self.device
@@ -763,6 +768,7 @@ class Trainer(object):
                     loss.backward()
 
                 pbar.set_description(f'loss: {total_loss:.4f}')
+                self.loss.append(total_loss)
 
                 self.opt.step()
                 self.opt.zero_grad()
@@ -789,3 +795,15 @@ class Trainer(object):
                 pbar.update(1)
 
         print('training complete')
+
+    def autodiff(self):
+        from jittor_utils import auto_diff
+        hook = auto_diff.Hook('diffusion')
+        hook.hook_module(self.model)
+        hook.hook_optimizer(self.opt)
+        data = next(self.ds)[0]
+        np.random.seed(0)
+        data = np.random.randint(0, 256, tuple(data.shape))
+        #breakpoint()
+        loss = self.model(torch.Tensor(data).to(self.device))
+        loss.backward()

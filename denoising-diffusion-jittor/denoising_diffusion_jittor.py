@@ -3,6 +3,7 @@ from jittor import nn
 from jittor.dataset import Dataset
 # from jittor import transform as T
 import math
+import numpy as np
 from inspect import isfunction
 from collections import namedtuple
 from functools import partial
@@ -12,7 +13,15 @@ from PIL import Image
 #from einops import rearrange, reduce
 from tqdm.auto import tqdm
 from ema_jittor import EMA
+
 ModelPrediction = namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
+
+# assign and copy require_grad attribute
+def assign_keep_grad(dest, src):
+    if dest.requires_grad:
+        dest.assign(src).start_grad()
+    else:
+        dest.assign(src).stop_grad()
 
 # jittor does not have SiLu
 class SiLU(jt.Module):
@@ -133,7 +142,7 @@ class Block(nn.Module):
     def __init__(self, dim, dim_out, groups=8):
         super().__init__()
         self.proj = nn.Conv(dim, dim_out, 3, padding=1)
-        self.norm = nn.GroupNorm(groups, dim_out, affine=None)
+        self.norm = nn.GroupNorm(groups, dim_out)
         self.act = SiLU()
 
     def execute(self, x, scale_shift=None):
@@ -282,7 +291,7 @@ class Unet(nn.Module):
 
 def extract(a, t, x_shape):
     (b, *_) = t.shape
-    out = a.gather((- 1), t)
+    out = a.gather((- 1), t.float32())
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
 def linear_beta_schedule(timesteps):
@@ -357,6 +366,7 @@ class GaussianDiffusion(nn.Module):
         setattr(self, name, val.float32().stop_grad())
 
     def model_predictions(self, x, t):
+        t = t.float32()
         model_output = self.model(x, t)
         if (self.objective == 'pred_noise'):
             pred_noise = model_output
@@ -370,14 +380,15 @@ class GaussianDiffusion(nn.Module):
         preds = self.model_predictions(x, t)
         x_start = preds.pred_x_start
         if clip_denoised:
-            x_start.assign(x_start.clamp((- 1.0), 1.0))
+            #x_start.assign(x_start.clamp((- 1.0), 1.0))
+            assign_keep_grad(x_start, x_start.clamp((- 1.0), 1.0))
         (model_mean, posterior_variance, posterior_log_variance) = self.q_posterior(x_start=x_start, x_t=x, t=t)
         return (model_mean, posterior_variance, posterior_log_variance)
 
     @jt.no_grad()
     def p_sample(self, x, t: int, clip_denoised=True):
         (b, *_) = x.shape
-        batched_times = jt.full((x.shape[0],), t)
+        batched_times = jt.full((x.shape[0],), t, dtype='int64')
         (model_mean, _, model_log_variance) = self.p_mean_variance(x=x, t=batched_times, clip_denoised=clip_denoised)
         noise = (jt.randn_like(x) if (t > 0) else 0.0)
         return (model_mean + ((0.5 * model_log_variance).exp() * noise))
@@ -401,10 +412,11 @@ class GaussianDiffusion(nn.Module):
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
             alpha = self.alphas_cumprod_prev[time]
             alpha_next = self.alphas_cumprod_prev[time_next]
-            time_cond = jt.full((batch,), time)
+            time_cond = jt.full((batch,), time, dtype='int64')
             (pred_noise, x_start, *_) = self.model_predictions(img, time_cond)
             if clip_denoised:
-                x_start.assign(x_start.clamp((- 1.0), 1.0))
+                #x_start.assign(x_start.clamp((- 1.0), 1.0))
+                assign_keep_grad(x_start, x_start.clamp((- 1.0), 1.0))
             sigma = (eta * (((1 - (alpha / alpha_next)) * (1 - alpha_next)) / (1 - alpha)).sqrt())
             c = ((1 - alpha_next) - (sigma ** 2)).sqrt()
             noise = (jt.randn_like(img) if (time_next > 0) else 0.0)
@@ -427,7 +439,7 @@ class GaussianDiffusion(nn.Module):
         (xt1, xt2) = map((lambda x: self.q_sample(x, t=t_batched)), (x1, x2))
         img = (((1 - lam) * xt1) + (lam * xt2))
         for i in tqdm(reversed(range(0, t)), desc='interpolation sample time step', total=t):
-            img = self.p_sample(img, jt.full((b,), i))
+            img = self.p_sample(img, jt.full((b,), i, dtype='int64'))
         return img
 
     def q_sample(self, x_start, t, noise=None):
@@ -463,9 +475,9 @@ class GaussianDiffusion(nn.Module):
     def execute(self, img, *args, **kwargs):
         (b, c, h, w, img_size) = (*img.shape, self.image_size)
         assert ((h == img_size) and (w == img_size)), f'height and width of image must be {img_size}'
-        t = jt.randint(0, self.num_timesteps, (b,))
+        t = jt.randint(0, self.num_timesteps, (b,)).int64()
         img = normalize_to_neg_one_to_one(img)
-        return self.p_losses(img, t, *args, **kwargs)
+        return self.p_losses(img, t.float32(), *args, **kwargs)
 
 class Dataset(Dataset):
 
@@ -501,16 +513,26 @@ class Trainer(object):
         # dl = DataLoader(self.ds, batch_size=train_batch_size, shuffle=True, pin_memory=True, num_workers=cpu_count())
         # self.dl = cycle(dl)
         self.opt = jt.optim.Adam(diffusion_model.parameters(), lr=train_lr, betas=adam_betas)
+        # params in diffusion model itself are all non-trainable
+        # only 
+        #no_ema_params = set( param[0] for param in self.model.named_parameters() if not 'model' in param[] )
         self.ema = EMA(diffusion_model, beta=ema_decay, update_every=ema_update_every)
         self.results_folder = Path(results_folder)
         self.results_folder.mkdir(exist_ok=True)
         self.step = 0
+        self.loss = []
 
-    def save(self, milestone, model_ext='pkl'):
-        data = {'step': self.step, 'model': self.model.state_dict(), 'opt': self.opt.state_dict(), 'ema': self.ema.state_dict()}
-        jt.save(v, str((self.results_folder / f'model-{milestone}.{model_ext}')))
+    def save(self, milestone, model_ext='pth'):
+        data = {
+            'step': self.step,
+            'model': self.model.state_dict(),
+            'opt': self.opt.state_dict(),
+            'ema': self.ema.state_dict(),
+            'loss': self.loss
+        }
+        jt.save(data, str((self.results_folder / f'model-{milestone}.{model_ext}')))
 
-    def load(self, milestone, folder=None, model_ext='pkl'):
+    def load(self, milestone, folder=None, model_ext='pth'):
         if folder is None:
             folder = self.results_folder
         else:
@@ -518,8 +540,10 @@ class Trainer(object):
         data = jt.load(str((folder / f'model-{milestone}.{model_ext}')))
         self.step = data['step']
         self.model.load_parameters(data['model'])
-        self.opt.load_state_dict(data['opt'])
-        self.ema.load_parameters(data['ema'])
+        #self.opt.load_state_dict(data['opt'])
+        #self.ema.load_parameters(data['ema'])
+        self.ema = EMA(self.model, beta=self.ema.beta, update_every=self.ema.update_every)
+        self.loss = data['loss']
 
     def train(self):
         with tqdm(initial=self.step, total=self.train_num_steps) as pbar:
@@ -530,9 +554,10 @@ class Trainer(object):
                     loss = self.model(data)
                     loss = (loss / self.gradient_accumulate_every)
                     total_loss += loss.item()
+                    self.opt.step(loss)
+                loss.sync()
                 pbar.set_description(f'loss: {total_loss:.4f}')
-                jt.sync_all(True)
-                self.opt.step(total_loss)
+                self.loss.append(total_loss)
                 self.ema.update()
                 if ((self.step != 0) and ((self.step % self.save_and_sample_every) == 0)):
                     self.ema.ema_model.eval()
@@ -544,15 +569,18 @@ class Trainer(object):
                     all_images = all_images.expand(-1, 3, *all_images.shape[2:])
                     jt.save_image(all_images, str((self.results_folder / f'sample-{milestone}.png')), nrow=int(math.sqrt(self.num_samples)))
                     self.save(milestone)
-                self.step += 1
-                pbar.update(1)
+                self.step += self.gradient_accumulate_every
+                pbar.update(self.gradient_accumulate_every)
         print('training complete')
     
     def autodiff(self):
         from jittor_utils import auto_diff
-        hook = auto_diff.Hook('diffusion_jittor')
+        hook = auto_diff.Hook('diffusion')
         hook.hook_module(self.model)
         hook.hook_optimizer(self.opt)
         data, _ = next(self.ds)
-        loss = self.model(data)
+        np.random.seed(0)
+        data = np.random.randint(0, 256, tuple(data.shape))
+        #breakpoint()
+        loss = self.model(jt.float32(data))
         loss.sync()

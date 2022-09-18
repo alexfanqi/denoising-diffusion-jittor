@@ -44,4 +44,8 @@ diffusion = GaussianDiffusion(
 )
 
 trainer = Trainer(diffusion, dl, device, train_num_steps=100, save_and_sample_every=101, num_samples=4, ema_update_every=10, train_lr=0.001)
-trainer.train()
+#trainer.load(0, '../denoising-diffusion-jittor/results/mnist')
+breakpoint()
+trainer.save("000")
+#trainer.train()
+#trainer.autodiff()
