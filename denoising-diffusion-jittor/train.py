@@ -6,8 +6,6 @@ from jittor.dataset.mnist import MNIST
 from jittor import transform as T
 from denoising_diffusion_jittor import Unet, GaussianDiffusion, Trainer
 
-# Dataset(folder, image_size, augment_horizontal_flip=augment_horizontal_flip, convert_image_to=convert_image_to)
-
 # def dir_path(string):
 #     if os.path.isdir(string):
 #         return string
